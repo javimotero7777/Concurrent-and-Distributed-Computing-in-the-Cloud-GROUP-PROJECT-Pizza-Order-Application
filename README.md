@@ -1,154 +1,144 @@
 # Pizza Order Application — Despliegue con Docker y CI/CD
 
-Práctica 4 — Final de Administración de Servidores.
-API REST de gestión de pizzerías (Express 5 + MariaDB), empaquetada con Docker, orquestada con Docker Compose y desplegada automáticamente en una VM de Azure mediante GitHub Actions.
+Práctica 4 de Administración de Servidores. Modalidad A (proyecto propio): partimos de la
+Pizza Order Application, una API REST que desarrollamos en otra asignatura, y la hemos
+containerizado, orquestado con Docker Compose y desplegado en una VM de Azure con un pipeline
+CI/CD en GitHub Actions.
 
 ## Arquitectura
 
-```
-                    ┌──────────────────────────────────────┐
-                    │              VM Azure                │
-   Internet ──:80──►│  ┌────────┐   ┌────────┐  ┌───────┐  │
-                    │  │ nginx  │──►│  app   │─►│  db   │  │
-                    │  │ proxy  │   │ Node22 │  │MariaDB│  │
-                    │  └────────┘   └────────┘  └───────┘  │
-                    │      frontend  │  backend (privada)  │
-                    └──────────────────────────────────────┘
-```
+Tres contenedores en la misma VM, conectados por redes Docker. Solo nginx publica un puerto.
 
-Tres servicios definidos en `docker-compose.yml`:
+```
+Internet --(SSH :50266)--> [ VM Azure ]
+                             nginx :80  -->  app :8080  -->  db :3306
+                             (proxy)         (Express)       (MariaDB)
+```
 
 | Servicio | Imagen              | Puerto | Función                                            |
 |----------|--------------------|--------|----------------------------------------------------|
-| `proxy`  | `nginx:1.27-alpine`| 80     | Único expuesto a internet. Reverse proxy a la app. |
-| `app`    | imagen propia GHCR | 8080   | API Express. **Sin puertos publicados** al host.   |
-| `db`     | `mariadb:11`       | 3306   | Persistencia. Volumen `db_data` para datos.        |
+| `proxy`  | `nginx:1.27-alpine`| 80     | Reverse proxy a la app. Único servicio publicado.  |
+| `app`    | imagen propia (GHCR)| 8080  | API Express. Sin puertos publicados al host.       |
+| `db`     | `mariadb:11`       | 3306   | Datos persistidos en el volumen `db_data`.         |
 
-La red `backend` es interna y privada — sólo `proxy`, `app` y `db` se ven entre sí. La red `frontend` es la que `nginx` publica al host. Esta separación es la que evita exponer la base de datos accidentalmente.
+Dos redes: `backend` (privada, conecta app y db) y `frontend` (la que nginx publica). Así la
+base de datos no queda expuesta fuera de la VM.
 
 ## Arrancar en local
 
-Requisitos: Docker Desktop (o Docker Engine + Compose v2).
+Requisitos: Docker Desktop o Docker Engine + Compose v2.
 
 ```bash
-cp .env.example .env        # rellena las contraseñas
+cp .env.example .env        # rellenar las contraseñas
 docker compose up --build   # construye y arranca los 3 servicios
 ```
 
 Probar:
 
 ```bash
-curl http://localhost/healthCheck     # devuelve "OK"
-curl http://localhost/api/people      # endpoint real (puede requerir JWT)
+curl http://localhost/healthCheck             # devuelve OK
+curl -X POST http://localhost/api/people/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"a@a.com","password":"password123","name":"A","lastname":"B","role":"manager"}'
 ```
 
 Parar:
 
 ```bash
-docker compose down          # mantiene los datos
-docker compose down -v       # borra también el volumen de la BD
+docker compose down       # mantiene los datos
+docker compose down -v    # borra también el volumen de la BD
 ```
 
 ## Pipeline CI/CD
 
-Definido en `.github/workflows/deploy.yml`. Se dispara en cada `push` a `main` (o manualmente desde la pestaña Actions).
+Definido en `.github/workflows/deploy.yml`. Se ejecuta en cada `push` a `main`. Tres jobs en
+este orden (los tests van primero a propósito: si el código no compila, no perdemos tiempo
+construyendo y subiendo la imagen):
 
-### Etapas
+1. **test** — `npm ci`, `node --check` sobre cada `.js` y `npm test` si existe.
+2. **build-and-push** — construye la imagen multi-stage y la publica en GHCR con los tags
+   `latest` y `sha-<commit>`.
+3. **deploy** — entra por SSH a la VM, copia el `docker-compose.yml` + config de nginx,
+   hace `docker compose pull` + `up -d` y comprueba con `curl /healthCheck`.
 
-1. **Test & lint** — `npm ci`, `node --check` sobre todos los `.js`, y `npm test` si existe.
-2. **Build & push** — construye la imagen multi-stage y la publica en `ghcr.io/<owner>/<repo>` con tags `latest` y `sha-<short>`.
-3. **Deploy** — SSH a la VM, copia `docker-compose.yml` + `nginx/default.conf` + `transactions.sql`, hace `docker compose pull && up -d` y verifica con `curl /healthCheck`.
+### Secrets configurados en el repo
 
-### Secrets necesarios en el repo
+| Secret             | Valor en nuestro caso                              |
+|--------------------|----------------------------------------------------|
+| `VPS_HOST`         | hostname de la VM (`ml-lab-….cloudapp.azure.com`)  |
+| `VPS_USER`         | `usj`                                              |
+| `VPS_PORT`         | `50266` (la VM no usa el 22 estándar)              |
+| `VPS_SSH_KEY`      | clave privada Ed25519 generada para el CI          |
+| `GHCR_PAT`         | token con permiso `read:packages`                  |
+| `JWT_KEY`          | clave de firma de los JWT                          |
+| `DB_PASSWORD`      | password del usuario `admin` de MariaDB            |
+| `DB_ROOT_PASSWORD` | password de root de MariaDB                        |
 
-Settings → Secrets and variables → Actions → New repository secret:
+`GITHUB_TOKEN` no hace falta crearlo, lo inyecta GitHub automáticamente.
 
-| Secret             | Qué es                                                   |
-|--------------------|----------------------------------------------------------|
-| `VPS_HOST`         | IP pública o DNS de la VM Azure                          |
-| `VPS_USER`         | Usuario SSH (recomendado: `deploy`)                      |
-| `VPS_PORT`         | Puerto SSH (por defecto `22`)                            |
-| `VPS_SSH_KEY`      | Clave **privada** SSH (sin passphrase) en formato OpenSSH|
-| `GHCR_PAT`         | Personal Access Token con scope `read:packages`          |
-| `JWT_KEY`          | Clave aleatoria larga para firmar JWT                    |
-| `DB_PASSWORD`      | Password del usuario `admin` de MariaDB                  |
-| `DB_ROOT_PASSWORD` | Password de root de MariaDB                              |
+## Preparar la VM (lo que hicimos una vez)
 
-> `GITHUB_TOKEN` no hace falta crearlo — GitHub lo inyecta automáticamente.
-
-## Preparar la VM Azure (una sola vez)
+La VM es de Azure Lab Services (Debian 11). Pasos que seguimos:
 
 ```bash
-# 1) Crear usuario "deploy" con permisos docker
-sudo adduser --disabled-password --gecos "" deploy
-sudo usermod -aG docker deploy
-
-# 2) En tu portátil, generar par de claves SSH dedicado para el CI
-ssh-keygen -t ed25519 -f ~/.ssh/azure_pizza_deploy -N ""
-
-# 3) Copiar la pública al servidor
-ssh-copy-id -i ~/.ssh/azure_pizza_deploy.pub deploy@<VPS_HOST>
-
-# 4) Instalar Docker (si no está)
+# Instalar Docker + Compose
 curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER   # para usar docker sin sudo (requiere reabrir sesión)
 
-# 5) Crear el directorio de trabajo
-sudo mkdir -p /home/deploy/pizza-app && sudo chown deploy:deploy /home/deploy/pizza-app
+# Generar una clave SSH dedicada para el CI (esto en el portátil)
+ssh-keygen -t ed25519 -f ~/.ssh/azure_pizza_ci -N ""
+
+# Copiar la pública a la VM
+ssh-copy-id -i ~/.ssh/azure_pizza_ci.pub -p 50266 usj@<VPS_HOST>
 ```
 
-En el portal de Azure, en el **Network Security Group** de la VM, abre los puertos:
-- **22** (SSH) — restringido a tu IP si puedes
-- **80** (HTTP)
-- **443** (HTTPS, si añades TLS más adelante)
+La clave privada `~/.ssh/azure_pizza_ci` es la que va en el secret `VPS_SSH_KEY`.
 
-El contenido de `~/.ssh/azure_pizza_deploy` (la clave **privada**) es lo que va en el secret `VPS_SSH_KEY`.
+## Acceder al servicio desplegado
+
+El puerto 80 de la VM no está abierto a internet (Azure Lab Services solo expone el puerto SSH
+que mapea el profesor). Para ver la app desde el navegador usamos un túnel SSH:
+
+```bash
+ssh -L 8080:localhost:80 -i ~/.ssh/azure_pizza_ci -p 50266 usj@<VPS_HOST>
+```
+
+Con el túnel abierto, `http://localhost:8080` apunta al puerto 80 dentro de la VM. Esto es
+también buena práctica de seguridad (la API no queda expuesta a internet, solo accesible por
+SSH). El despliegue automático funciona igual porque GitHub Actions entra por el puerto SSH.
 
 ## Buenas prácticas aplicadas
 
-- **Multi-stage build** — la imagen final no contiene `npm`, devDependencies ni el lock; pesa ~150 MB en lugar de ~400 MB.
-- **Usuario non-root** — el contenedor corre como el usuario `node` (UID 1000) que viene en la imagen `node:alpine`.
-- **`tini` como PID 1** — propaga `SIGTERM` correctamente para apagado limpio.
-- **Healthcheck** — Docker reinicia el contenedor si `/healthCheck` falla.
-- **Red interna privada** — la BD nunca se publica al host.
-- **Secrets fuera del repo** — `.env` está en `.gitignore` y se construye en la VM desde los secrets de GitHub en cada deploy.
-- **Imagen base ligera** — `node:22-alpine` (~60 MB) y `mariadb:11` (~250 MB) en vez de las variantes Debian.
+- Multi-stage build: la imagen final no lleva `npm` ni devDependencies (~150 MB en vez de ~400).
+- Usuario non-root: el contenedor corre como el usuario `node` (UID 1000).
+- `tini` como PID 1 para que `docker stop` haga un apagado limpio.
+- Healthcheck contra `/healthCheck`; Docker reinicia el contenedor si falla.
+- Red interna privada: la BD no se publica al host.
+- Secrets fuera del repo: el `.env` está en `.gitignore` y se genera en la VM desde los secrets.
 
-## ⚠️ Acciones pendientes en el repo
+## Problemas que encontramos
 
-El `.env` está committeado en `main` con credenciales. Antes del primer push hay que:
-
-```bash
-git rm --cached .env
-git commit -m "stop tracking .env (moved to .gitignore)"
-```
-
-Y rotar la `JWT_KEY` que está hardcodeada en el histórico (ya no será válida en producción, pero conviene asumir que está comprometida).
-
-## Memoria técnica
-
-### Decisiones de diseño
-
-- **MariaDB en vez de PostgreSQL** — el código ya usa el driver `mariadb` y el esquema (`transactions.sql`) está escrito con sintaxis MySQL/MariaDB (CHECKs con REGEXP, ENUM, ON UPDATE CURRENT_TIMESTAMP). Cambiar a Postgres habría implicado reescribir migraciones.
-- **nginx como reverse proxy** — añade una capa de aislamiento útil incluso con un solo backend: oculta puertos internos, gestiona timeouts y deja preparado el camino para TLS, rate-limiting o cabeceras de seguridad sin tocar la app.
-- **Imagen publicada en GHCR (no Docker Hub)** — GHCR está integrado con GitHub Actions, autenticación con `GITHUB_TOKEN`, sin tirar de cuotas de pulls anónimos.
-- **Tag `latest` + `sha-<short>`** — `latest` para conveniencia, SHA para poder hacer rollback puntual (`docker compose pull` con `APP_IMAGE` apuntando al SHA anterior).
-- **`docker compose pull && up -d`** — recreación mínima: solo el contenedor `app` se reemplaza si la imagen cambió; `db` y `proxy` siguen vivos, así que no perdemos conexión a la BD entre deploys.
-
-### Problemas encontrados
-
-- *(rellenar durante el desarrollo: errores de healthcheck, problemas de permisos en el volumen de MariaDB, etc.)*
+- **`.env` con credenciales en el repo original.** Lo sacamos del control de versiones con
+  `git rm --cached .env`, lo metimos en `.gitignore` y movimos las credenciales a los secrets.
+- **`DB_HOST=0.0.0.0` en el código.** No funciona dentro de Compose; lo cambiamos a `db`, que
+  es el nombre del servicio y se resuelve por la red interna de Docker.
+- **El `test` por defecto de `npm init` rompía el CI.** El `package.json` traía
+  `"test": "echo ... && exit 1"`, que siempre falla. Lo quitamos.
+- **Puerto 80 cerrado en la VM.** Es una limitación del laboratorio; lo resolvimos con el túnel
+  SSH descrito arriba.
+- **El healthcheck del deploy fallaba al arrancar.** MariaDB tarda unos segundos en estar lista,
+  así que el smoke test del pipeline reintenta varias veces antes de dar el deploy por fallido.
 
 ## Endpoints
 
-Importar `ConcurrencyFinalProject Collection.postman_collection.json` en Postman/Insomnia para ver todos los endpoints con ejemplos.
+| Recurso   | Rutas principales                          |
+|-----------|--------------------------------------------|
+| Health    | `GET /healthCheck`                         |
+| Usuarios  | `POST /api/people/signup`, `/login`        |
+| Pizzerías | `/api/pizzaPlaces`                         |
+| Pizzas    | `/api/pizzas`                              |
+| Cocineros | `/api/cooks`                               |
+| Pedidos   | `/api/orders`                              |
 
-Resumen:
-
-| Recurso         | Path             |
-|----------------|------------------|
-| Health         | `GET /healthCheck` |
-| Usuarios       | `/api/people`    |
-| Pizzerías      | `/api/pizzaPlaces` |
-| Pizzas         | `/api/pizzas`    |
-| Cocineros      | `/api/cooks`     |
-| Pedidos        | `/api/orders`    |
+La colección de Postman (`ConcurrencyFinalProject Collection.postman_collection.json`) tiene
+todos los endpoints con ejemplos.
