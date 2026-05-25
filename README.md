@@ -142,3 +142,5 @@ SSH). El despliegue automático funciona igual porque GitHub Actions entra por e
 
 La colección de Postman (`ConcurrencyFinalProject Collection.postman_collection.json`) tiene
 todos los endpoints con ejemplos.
+
+<!-- prueba de despliegue -->
